@@ -1,0 +1,181 @@
+clc;
+clear;
+tic
+%% parameter setting
+N = 30; % number of similation times
+Nslot = 10;   Nsymbols = 14*Nslot; %number of OFDM symbols
+Nprb = 264;    Ncarriers = Nprb*12;  %number of subcarriers 264*12=3168
+N_GB = 66;  % number of guard band carriers
+Nfft = Ncarriers+2*N_GB; %number of FFT points for OFDM3300
+Nfft_d = 4096; Nfft_v = 256; %number of FFT points for distance/velocity estimation for Strum methods
+SNR_list = [-50:5:0];
+f_c = 26*10^9; % carrier frequency
+c = 3*10^8;
+lambda = c/f_c;
+
+R = [90,50]; %multiple target distance
+v = [10,20]; %multiple target velocity
+
+delta_f =120*10^3;  % subcarrier spacing
+Ts = 1/(delta_f*Nfft); % sampling time
+Tofdm = 1/delta_f; %OFDM period (exluding CP)
+T = 0.125e-3/14; %OFDM period (including CP)
+Tcp = T - Tofdm; %CP period
+Ncp = round(Nfft*Tcp/Tofdm); %length of CP
+
+%% ****************序列值生成*******************
+Glength=32;
+RBnum=Ncarriers*Nsymbols;%可以传递信息的RB数
+Gnum=ceil(RBnum/Glength);%需要多少组Golay码，对应可以传输的bit数
+bitin = randi([0 1], Gnum, 1); %bit sequence
+bitin(bitin(:)==0,:)=-1;
+PCseq=zeros(1,Gnum*Glength);
+for i=1:Gnum
+    PCseq(1,Glength*(i-1)+1:Glength*i)=bitin(i,1);
+end
+PCseq=PCseq(1,1:RBnum);
+PCseq=reshape(PCseq,Ncarriers,RBnum/Ncarriers);
+
+%% OFDM modulation
+IFFT_matrix=zeros(Nfft_d,Nsymbols);
+for i=1:Nsymbols
+    IFFT_matrix(67:66+3168,i)=PCseq(:,i);
+end
+IFFT_after=ifft(IFFT_matrix,Nfft_d);
+
+Tx_data=IFFT_after;
+
+%% 添加噪声
+R_esprit=zeros(1,13);
+V_esprit=zeros(1,13);
+R_music=zeros(1,13);
+V_music=zeros(1,13);
+R_fft=zeros(1,13);
+V_fft=zeros(1,13);
+SNR_dB=-40:5:20;
+for ind=1:13
+    %for kk=1:1:20
+        %% 解调
+        Rx_data=awgn(Tx_data,SNR_dB(ind));
+        Rx_complex_carrier_matrix = fft(Rx_data,Nfft_d);%得到复信号
+        channelinfo=zeros(Ncarriers,Nsymbols );
+        for k=1:Nsymbols
+            channelinfo(:,k)= Rx_complex_carrier_matrix(67:3234,k);
+        end
+        
+        %% 构建信道信息矩阵
+        doa=0:1:(Ncarriers-1);
+        m=0:1:(Nsymbols-1);
+        %*******************构建 Kr 向量*******************
+        kr = zeros(1,Ncarriers);% carrier_count是子载波个数
+        kr = exp(-1j*4*pi*doa.'*delta_f*R(1)/c);
+        %*******************构建 Kd 向量*******************
+        kd = zeros(1,Nsymbols);
+        kd = exp(1j * 2 * pi * Tofdm *m.' * 2 * v(1) * f_c / c);
+        
+        Rx_complex_carrier_matrix_radar = 1 * channelinfo .* (kr *  kd');
+        Rx_complex_carrier_matrix_radar1=Rx_complex_carrier_matrix_radar./channelinfo;
+        
+        %% ==========2D FFT====================
+        % ======================测距===================================
+        
+        div_IFFT=zeros(1,Ncarriers);%做IFFT寻找峰值时，储存IFFT的结果
+        div_R = Rx_complex_carrier_matrix_radar1 (:,1);
+        cur_div_IFFT = ifft(div_R');
+        [max_R,index_R] = max(cur_div_IFFT);
+        % 根据论文中的公式可以求出速距离
+        F_R = ((index_R-1) / Ncarriers) * (c / 2 / delta_f);
+        R_fft(ind) = R_fft(ind)+(F_R-R(1)).^2;
+        
+        % ======================测速===================================
+        div_FFT=zeros(1,Nsymbols);%做FFT寻找峰值时，储存FFT的结果
+        div_v = Rx_complex_carrier_matrix_radar1 (1,:);
+        cur_div_FFT = fft(div_v);
+        [max_v,index_v] = max(cur_div_FFT);
+        % 根据论文中的公式可以求出速度
+        F_V = ((index_v-1)*c / (2*f_c*Nsymbols*(1/delta_f)));
+        V_fft(ind) = V_fft(ind)+(F_V-v(1)).^2;
+        
+        %% ==========MUSIC====================
+        % ********MUSIC算法-distance********
+        Ry_distance = Rx_complex_carrier_matrix_radar1(:,1); % 提取第一列做时延估计
+        Ryy=Ry_distance*Ry_distance'; % 估计样本相关矩阵（矩阵乘以它的转置，为自相关矩阵）
+        [U,S,V]=svd(Ryy);   % 矩阵分解
+        G=U(:,2:Ncarriers);  % 噪声子空间
+        Gn=G*G';
+        search_r=0:0.5:100;
+        doa=0:1:(Ncarriers-1);
+        for i=1:length(search_r)
+            r=exp(-1j * 2 * pi * doa' * delta_f * 2 * search_r(i) / c);
+            p(i)=1./abs(r'*Gn*r);
+        end
+        [max_r,index_r_M]=max(p);
+        M_R = (index_r_M-1)*0.5;
+        %         figure;
+        %         plot(search_r,10*log(p),'r');
+        %         disp((index_r_M-1)*0.5);
+        R_music(ind)=R_music(ind)+(M_R-R(1)).^2;
+        %         xlabel('距离/(m)');
+        %         ylabel('空间谱/(dB)');
+        %         title('MUSIC算法测距图');
+        
+        % ********MUSIC算法-velocity********
+        Ry_velocity = Rx_complex_carrier_matrix_radar1(1,:);
+        Ryy2=Ry_velocity' * Ry_velocity; % 估计样本相关矩阵（矩阵乘以它的转置，为自相关矩阵）
+        [U2,S2,V2]=svd(Ryy2);   % 矩阵分解
+        G2=U2(:,2:Nsymbols);  % 噪声子空间
+        Gn2=G2*G2';
+        search_v=0:0.5:100;%步长可以大一点
+        for i=1:length(search_v)
+            r_velocity=exp(1j * 2 * pi * Tofdm *m.' * 2 * search_v(i) * f_c / c);
+            p2(i)=1./abs(r_velocity'*Gn2*r_velocity);
+        end
+        [max_v,index_v_M]=max(p2);
+        M_V = index_v_M*0.5;
+        %         figure;
+        %         plot(search_v,10*log(p2),'b');
+        V_music(ind)=V_music(ind)+(M_V-v(1)).^2;
+        %         xlabel('速度/(m/s)');
+        %         ylabel('空间谱/(dB)');
+        %         title('MUSIC算法测速图');
+        
+        %% ==========ESIPRIT============
+        % ********Esprit算法测距处理*******
+        Ry_distance = Rx_complex_carrier_matrix_radar1(:,1); % 提取第一列做时延估计
+        Rxx_d = Ry_distance*Ry_distance';
+        % Rxx_d = kr*kr'/Ncarriers;
+        [V_d,D_d]=eig(Rxx_d);
+        % [Y,I]=sort(diag(D));
+        Us_d=V_d(:,Ncarriers:Ncarriers);
+        U1_d=Us_d(1:Ncarriers-1,:);
+        U2_d=Us_d(2:Ncarriers,:);
+        [p_d,q_d]=eig(inv(U1_d'*U1_d)*U1_d'*U2_d);          %张贤达《矩阵分析与应用》 第528页
+        d=real(j*log(q_d(1,1))*c/(4*pi*delta_f)); % 返回反正弦函数值;real返回实部
+        R_esprit(ind)=R_esprit(ind)+(d-R(1)).^2;
+        
+        % ********Esprit算法测速处理*******
+        Ry_velocity = Rx_complex_carrier_matrix_radar1(1,:);
+        Rxx_v = Ry_velocity'*Ry_velocity;
+        [V_v,D_v]=eig(Rxx_v);
+        Us_v=V_v(:,Nsymbols:Nsymbols);
+        U1_v=Us_v(1:Nsymbols-1,:);
+        U2_v=Us_v(2:Nsymbols,:);
+        [p_v,q_v]=eig(inv(U1_v'*U1_v)*U1_v'*U2_v);          %张贤达《矩阵分析与应用》 第528页
+        vel=real(-j*log(q_v(1,1))*c/(4*pi*f_c*Tofdm)); % 返回反正弦函数值;real返回实部
+        V_esprit(ind)=V_esprit(ind)+(vel-v(1)).^2;
+    %end
+end
+RMSE_FFT_d = sqrt(R_fft/1);
+RMSE_MUSIC_d = sqrt(R_music/1);
+RMSE_ESPRIT_d = sqrt(R_esprit/1);
+figure(1)
+semilogy(SNR_dB,RMSE_FFT_d,SNR_dB,RMSE_MUSIC_d,SNR_dB,RMSE_ESPRIT_d);
+legend('2D-FFT','MUSIC','ESPRIT');
+
+RMSE_FFT_v = sqrt(V_fft/1);
+RMSE_MUSIC_v = sqrt(V_music/1);
+RMSE_ESPRIT_v = sqrt(V_esprit/1);
+figure(2)
+semilogy(SNR_dB,RMSE_FFT_v,SNR_dB,RMSE_MUSIC_v,SNR_dB,RMSE_ESPRIT_v);
+legend('2D-FFT','MUSIC','ESPRIT');
+toc
